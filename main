@@ -1,0 +1,179 @@
+import concurrent.futures
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, urlunparse
+import time
+import logging
+import random
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s][%(levelname)s][%(threadName)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+]
+
+HEADERS = {"Accept-Language": "en-US,en;q=0.9"}
+
+class RobotsTxt:
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.allowed_paths = []
+        self.disallowed_paths = []
+        self.fetch_robots_txt()
+
+    def fetch_robots_txt(self):
+        robots_url = urljoin(self.base_url, "/robots.txt")
+        try:
+            resp = requests.get(robots_url, timeout=5, headers={"User-Agent": random.choice(USER_AGENTS)})
+            if resp.status_code == 200:
+                self.parse_robots_txt(resp.text)
+            else:
+                logging.info(f"No robots.txt found at {robots_url} (status {resp.status_code}), allowing all")
+        except Exception as e:
+            logging.warning(f"Failed to fetch robots.txt at {robots_url}: {e}")
+
+    def parse_robots_txt(self, text):
+        user_agent = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("user-agent:"):
+                user_agent = line.split(":", 1)[1].strip()
+            elif user_agent == "*" and line.lower().startswith("disallow:"):
+                path = line.split(":", 1)[1].strip()
+                self.disallowed_paths.append(path)
+            elif user_agent == "*" and line.lower().startswith("allow:"):
+                path = line.split(":", 1)[1].strip()
+                self.allowed_paths.append(path)
+
+    def can_fetch(self, url):
+        parsed_base = urlparse(self.base_url)
+        parsed_url = urlparse(url)
+        if parsed_base.netloc != parsed_url.netloc:
+            return False
+        path = parsed_url.path
+        for allowed_path in self.allowed_paths:
+            if allowed_path and path.startswith(allowed_path):
+                return True
+        for disallowed_path in self.disallowed_paths:
+            if disallowed_path and path.startswith(disallowed_path):
+                return False
+        return True
+
+class Spider:
+    def __init__(self, name, start_url, max_pages=20, max_depth=3, delay=1.0, max_retries=3):
+        self.name = name
+        self.start_url = start_url
+        self.max_pages = max_pages
+        self.max_depth = max_depth
+        self.delay = delay
+        self.max_retries = max_retries
+
+        self.visited = set()
+        self.to_visit = [(start_url, 0)]
+        self.results = []
+
+        self.domain = urlparse(start_url).netloc
+        self.scheme = urlparse(start_url).scheme
+        self.robots = RobotsTxt(f"{self.scheme}://{self.domain}")
+
+    def crawl(self):
+        while self.to_visit and len(self.visited) < self.max_pages:
+            url, depth = self.to_visit.pop(0)
+            if url in self.visited:
+                continue
+            if depth > self.max_depth:
+                logging.debug(f"{self.name}: Max depth reached at {url}")
+                continue
+            if not self.robots.can_fetch(url):
+                logging.info(f"{self.name}: Skipping {url} due to robots.txt")
+                continue
+            success = self.fetch(url, depth)
+            if not success:
+                logging.info(f"{self.name}: Failed to fetch {url} after retries")
+            time.sleep(self.delay)
+
+    def fetch(self, url, depth):
+        headers = HEADERS.copy()
+        headers["User-Agent"] = random.choice(USER_AGENTS)
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                logging.info(f"{self.name}: Fetching {url} (Attempt {attempt})")
+                resp = requests.get(url, timeout=10, headers=headers)
+                if resp.status_code != 200:
+                    logging.warning(f"{self.name}: Non-200 status {resp.status_code} for {url}")
+                    return False
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                title = soup.title.string.strip() if soup.title else ""
+                desc_tag = soup.find("meta", attrs={"name": "description"})
+                description = desc_tag["content"].strip() if desc_tag else ""
+
+                self.results.append({
+                    "url": url,
+                    "title": title,
+                    "description": description,
+                    "depth": depth
+                })
+                self.visited.add(url)
+
+                for a_tag in soup.find_all("a", href=True):
+                    href = urljoin(url, a_tag["href"])
+                    parsed_href = urlparse(href)
+                    norm_href = urlunparse(parsed_href._replace(query="", fragment=""))
+                    if parsed_href.scheme in ("http", "https") and parsed_href.netloc == self.domain:
+                        if norm_href not in self.visited and all(norm_href != u for u, _ in self.to_visit):
+                            self.to_visit.append((norm_href, depth + 1))
+
+                return True
+            except requests.RequestException as e:
+                wait = 2 ** attempt
+                logging.warning(f"{self.name}: Error fetching {url}: {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            except Exception as e:
+                logging.error(f"{self.name}: Unexpected error: {e}")
+                return False
+        return False
+
+    def save_results(self):
+        txt_file = f"{self.name}_results.txt"
+        with open(txt_file, "w", encoding="utf-8") as f:
+            for entry in self.results:
+                f.write(f"URL: {entry['url']}\n")
+                f.write(f"Title: {entry['title']}\n")
+                f.write(f"Description: {entry['description']}\n")
+                f.write(f"Depth: {entry['depth']}\n")
+                f.write("-" * 40 + "\n")
+        logging.info(f"{self.name}: Saved results to {txt_file}")
+
+def spider_worker(spider: Spider):
+    logging.info(f"Starting spider {spider.name}")
+    spider.crawl()
+    spider.save_results()
+    logging.info(f"Finished spider {spider.name}")
+
+def main():
+    spiders = [
+        Spider("Spider1", "https://example.com", max_pages=15, max_depth=2, delay=1.0),
+        Spider("Spider2", "https://httpbin.org", max_pages=10, max_depth=2, delay=1.5),
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(spiders)) as executor:
+        futures = [executor.submit(spider_worker, spider) for spider in spiders]
+        concurrent.futures.wait(futures)
+
+    logging.info("All spiders finished.")
+
+if __name__ == "__main__":
+    main()
