@@ -1,4 +1,6 @@
+⚠️ DISCLAIMER: This project is for educational purposes only. It is intended to demonstrate how web crawlers/scappers work in a controlled, ethical environment. Do not use this code to scrape/crawl unethically. The author is not responsible for any misuse.
 
+This project is part of a cybersecurity learning journey. It is intended to demonstrate how keylogging works so defenders can better detect and prevent it. Unauthorized use of this tool violates laws and GitHub's Acceptable Use Policies.
 
 # 🕷 Web Crawler Ethical (OSINT Automation)
 
